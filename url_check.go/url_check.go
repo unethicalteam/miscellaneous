@@ -2,6 +2,7 @@ package main
 
 import (
     "encoding/json"
+    "flag"
     "fmt"
     "io/ioutil"
     "net/http"
@@ -9,14 +10,17 @@ import (
     "time"
 )
 
+// constants for output formatting
 const (
-    ColorRed    = "\033[31m"
-    ColorGreen  = "\033[32m"
-    ColorReset  = "\033[0m"
-    MaxRetries  = 3 // Maximum number of retries for checking a URL
-    maxConcurrentChecks = 30 // Maximum URLs to check at once
+    colorRed    = "\033[31m"
+    colorGreen  = "\033[32m"
+    colorReset  = "\033[0m"
 )
 
+// global variable for max retries
+var maxRetries int
+
+// readURLsFromFile reads urls from a json file. it's simple: give it a file path, and it gives you urls.
 func readURLsFromFile(filePath string) ([]string, error) {
     var urls []string
     data, err := ioutil.ReadFile(filePath)
@@ -27,29 +31,36 @@ func readURLsFromFile(filePath string) ([]string, error) {
     return urls, err
 }
 
+// checkURL checks if a url is active. it tries a few times (based on maxRetries) before giving up.
 func checkURL(url string, wg *sync.WaitGroup, activeURLs *[]string, mutex *sync.Mutex) {
     defer wg.Done()
 
-    for attempts := 0; attempts < MaxRetries; attempts++ {
+    for attempt := 0; attempt < maxRetries; attempt++ {
         resp, err := http.Head(url)
         if err == nil {
             defer resp.Body.Close()
             if resp.StatusCode == http.StatusOK {
                 mutex.Lock()
-                fmt.Printf("%s %s(active)%s\n", url, ColorGreen, ColorReset)
+                fmt.Printf("%s %s(active)%s\n", url, colorGreen, colorReset)
                 *activeURLs = append(*activeURLs, url)
                 mutex.Unlock()
                 return
             }
         }
-        time.Sleep(time.Second)
     }
 
     mutex.Lock()
-    fmt.Printf("%s %s(dead)%s\n", url, ColorRed, ColorReset)
+    fmt.Printf("%s %s(dead)%s\n", url, colorRed, colorReset)
     mutex.Unlock()
 }
 
+// handleSingleURL is a helper to keep things neat. it just manages one url check.
+func handleSingleURL(url string, semaphore chan struct{}, wg *sync.WaitGroup, activeURLs *[]string, mutex *sync.Mutex) {
+    defer func() { <-semaphore }() // this line makes sure we play nice with others
+    checkURL(url, wg, activeURLs, mutex)
+}
+
+// processURLs is where the magic happens. it checks all the urls, but not all at once.
 func processURLs(urls []string, maxConcurrentChecks int) []string {
     var wg sync.WaitGroup
     var activeURLs []string
@@ -58,19 +69,16 @@ func processURLs(urls []string, maxConcurrentChecks int) []string {
     semaphore := make(chan struct{}, maxConcurrentChecks)
 
     for _, url := range urls {
-        semaphore <- struct{}{}
+        semaphore <- struct{}{} // got a permit? go ahead.
         wg.Add(1)
-        go func(url string) {
-            defer func() { <-semaphore }()
-            checkURL(url, &wg, &activeURLs, &mutex)
-        }(url)
+        go handleSingleURL(url, semaphore, &wg, &activeURLs, &mutex)
     }
 
-    wg.Wait()
+    wg.Wait() // hold on till everyone's done
     return activeURLs
 }
 
-
+// writeURLsToFile writes urls to a json file. nothing fancy, just saving stuff.
 func writeURLsToFile(urls []string, filePath string) error {
     data, err := json.MarshalIndent(urls, "", "    ")
     if err != nil {
@@ -80,22 +88,39 @@ func writeURLsToFile(urls []string, filePath string) error {
 }
 
 func main() {
+    // let's grab some flags from the command line
+    maxConcurrentChecksFlag := flag.Int("concurrent", 10, "how many urls we check at once")
+    maxRetriesFlag := flag.Int("retries", 3, "how many times we try a url before giving up")
+    urlsFileFlag := flag.String("urlsFile", "urls.json", "where your urls are stored")
+
+    flag.Parse()
+
+    // using the flags
+    maxConcurrentChecks := *maxConcurrentChecksFlag
+    maxRetries = *maxRetriesFlag
+    urlsFile := *urlsFileFlag
+
+    // starting the clock
     startTime := time.Now()
 
-    urls, err := readURLsFromFile("urls.json")
+    // read urls from the file
+    urls, err := readURLsFromFile(urlsFile)
     if err != nil {
-        fmt.Println("Error reading URLs:", err)
+        fmt.Println("whoops! couldn't read the urls:", err)
         return
     }
 
+    // let's get to work!
     activeURLs := processURLs(urls, maxConcurrentChecks)
 
-    err = writeURLsToFile(activeURLs, "urls.json")
+    // saving the active urls back to the file
+    err = writeURLsToFile(activeURLs, urlsFile)
     if err != nil {
-        fmt.Println("Error writing active URLs:", err)
+        fmt.Println("hmm, couldn't write the active urls:", err)
         return
     }
 
+    // all done, let's see how long it took
     elapsedTime := time.Since(startTime)
-    fmt.Printf("\nURL check completed in %s. Active URLs updated.\n", elapsedTime)
+    fmt.Printf("all done! it took %s. active urls are now saved.\n", elapsedTime)
 }
